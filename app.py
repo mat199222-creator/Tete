@@ -1,103 +1,85 @@
+import io
+import json
 import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk, ImageOps, ImageFilter
+from pathlib import Path
 
-APP_TITLE = "OX Background Remover Tool"
-APP_VERSION = "1.1.0"
+import requests
+from PIL import Image, ImageTk, ImageFilter, ImageOps
 
-
-def color_distance(c1, c2):
-    return abs(c1[0] - c2[0]) + abs(c1[1] - c2[1]) + abs(c1[2] - c2[2])
-
-
-def average_colors(colors):
-    if not colors:
-        return (255, 255, 255)
-    r = sum(c[0] for c in colors) // len(colors)
-    g = sum(c[1] for c in colors) // len(colors)
-    b = sum(c[2] for c in colors) // len(colors)
-    return (r, g, b)
+APP_TITLE = "OX RemoveBG Tool"
+APP_VERSION = "1.0.0"
+CONFIG_PATH = Path("config.json")
 
 
-def detect_background_color(img):
-    w, h = img.size
+def load_config():
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+    return {"api_key": ""}
+
+
+def save_config(data):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def crop_transparent(img):
+    bbox = img.getbbox()
+    if bbox:
+        return img.crop(bbox)
+    return img
+
+
+def fit_to_canvas(img, final_size=100, padding=4, sharpen=True):
+    usable = max(1, final_size - padding * 2)
+    contained = ImageOps.contain(img, (usable, usable), method=Image.LANCZOS)
+    if sharpen:
+        contained = contained.filter(ImageFilter.SHARPEN)
+
+    canvas = Image.new("RGBA", (final_size, final_size), (0, 0, 0, 0))
+    x = (final_size - contained.width) // 2
+    y = (final_size - contained.height) // 2
+    canvas.alpha_composite(contained, (x, y))
+    return canvas
+
+
+def checkerboard(width, height, block=20):
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 255))
     px = img.load()
-
-    sample_points = []
-    margin_x = max(1, w // 20)
-    margin_y = max(1, h // 20)
-
-    corners = [
-        (0, 0),
-        (w - 1, 0),
-        (0, h - 1),
-        (w - 1, h - 1),
-    ]
-
-    for cx, cy in corners:
-        for dx in range(margin_x):
-            for dy in range(margin_y):
-                x = min(max(cx + (-dx if cx > 0 else dx), 0), w - 1)
-                y = min(max(cy + (-dy if cy > 0 else dy), 0), h - 1)
-                sample_points.append(px[x, y][:3])
-
-    return average_colors(sample_points)
+    c1 = (70, 70, 70, 255)
+    c2 = (100, 100, 100, 255)
+    for y in range(height):
+        for x in range(width):
+            px[x, y] = c1 if ((x // block) + (y // block)) % 2 == 0 else c2
+    return img
 
 
-def remove_background_and_crop(img, tolerance=60, feather_alpha=True):
-    img = img.convert("RGBA")
-    bg = detect_background_color(img)
-    px = img.load()
-    w, h = img.size
-
-    min_x, min_y = w, h
-    max_x, max_y = 0, 0
-    found = False
-
-    for y in range(h):
-        for x in range(w):
-            r, g, b, a = px[x, y]
-            dist = color_distance((r, g, b), bg)
-
-            if dist <= tolerance:
-                if feather_alpha:
-                    alpha = int(max(0, min(255, (dist / max(tolerance, 1)) * 255)))
-                    px[x, y] = (r, g, b, alpha)
-                else:
-                    px[x, y] = (r, g, b, 0)
-            else:
-                found = True
-                min_x = min(min_x, x)
-                min_y = min(min_y, y)
-                max_x = max(max_x, x)
-                max_y = max(max_y, y)
-
-    if not found:
-        return img, bg
-
-    cropped = img.crop((min_x, min_y, max_x + 1, max_y + 1))
-    return cropped, bg
-
-
-class RenderApp:
+class App:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_TITLE} {APP_VERSION}")
-        self.root.geometry("1100x780")
+        self.root.geometry("1120x780")
         self.root.minsize(1000, 720)
 
-        self.image = None
-        self.processed_image = None
-        self.preview_image = None
+        self.config = load_config()
         self.current_path = None
+        self.original_image = None
+        self.removed_bg_image = None
+        self.final_image = None
+        self.preview_image = None
 
+        self.api_key_var = tk.StringVar(value=self.config.get("api_key", ""))
         self.size_var = tk.IntVar(value=100)
         self.padding_var = tk.IntVar(value=4)
-        self.tolerance_var = tk.IntVar(value=60)
+        self.crop_var = tk.BooleanVar(value=True)
         self.sharpen_var = tk.BooleanVar(value=True)
-        self.auto_crop_var = tk.BooleanVar(value=True)
-        self.feather_var = tk.BooleanVar(value=True)
 
         self.build_ui()
 
@@ -111,10 +93,17 @@ class RenderApp:
         right = ttk.Frame(main)
         right.pack(side="right", fill="both", expand=True)
 
-        ttk.Label(left, text="OX Background Remover", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
+        ttk.Label(left, text="OX RemoveBG Tool", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(left, text="API key remove.bg").pack(anchor="w")
+        ttk.Entry(left, textvariable=self.api_key_var, show="*", width=38).pack(fill="x", pady=(4, 8))
+        ttk.Button(left, text="Zapisz klucz", command=self.save_api_key).pack(fill="x", pady=4)
+
+        ttk.Separator(left).pack(fill="x", pady=10)
 
         ttk.Button(left, text="Wczytaj obraz", command=self.load_image).pack(fill="x", pady=4)
-        ttk.Button(left, text="Zapisz PNG", command=self.save_image).pack(fill="x", pady=4)
+        ttk.Button(left, text="Usuń tło przez remove.bg", command=self.remove_background).pack(fill="x", pady=4)
+        ttk.Button(left, text="Zapisz finalny PNG", command=self.save_image).pack(fill="x", pady=4)
         ttk.Button(left, text="Batch render folderu", command=self.batch_render).pack(fill="x", pady=4)
 
         ttk.Separator(left).pack(fill="x", pady=10)
@@ -122,62 +111,51 @@ class RenderApp:
         ttk.Label(left, text="Rozmiar końcowy (px)").pack(anchor="w")
         size_box = ttk.Combobox(left, textvariable=self.size_var, values=[64, 100, 128, 256, 512], state="readonly")
         size_box.pack(fill="x", pady=(4, 8))
-        size_box.bind("<<ComboboxSelected>>", lambda e: self.update_preview())
+        size_box.bind("<<ComboboxSelected>>", lambda e: self.rebuild_final())
 
         ttk.Label(left, text="Padding").pack(anchor="w")
-        padding_scale = ttk.Scale(left, from_=0, to=20, orient="horizontal", command=self._on_padding_change)
-        padding_scale.set(self.padding_var.get())
-        padding_scale.pack(fill="x", pady=(4, 2))
-        self.padding_label = ttk.Label(left, text=f"{self.padding_var.get()} px")
-        self.padding_label.pack(anchor="w", pady=(0, 8))
+        pad = ttk.Scale(left, from_=0, to=20, orient="horizontal", command=self._on_padding)
+        pad.set(self.padding_var.get())
+        pad.pack(fill="x", pady=(4, 2))
+        self.pad_label = ttk.Label(left, text=f"{self.padding_var.get()} px")
+        self.pad_label.pack(anchor="w", pady=(0, 8))
 
-        ttk.Label(left, text="Czułość usuwania tła").pack(anchor="w")
-        tolerance_scale = ttk.Scale(left, from_=5, to=150, orient="horizontal", command=self._on_tolerance_change)
-        tolerance_scale.set(self.tolerance_var.get())
-        tolerance_scale.pack(fill="x", pady=(4, 2))
-        self.tolerance_label = ttk.Label(left, text=str(self.tolerance_var.get()))
-        self.tolerance_label.pack(anchor="w", pady=(0, 8))
-
-        ttk.Checkbutton(left, text="Wyostrz obraz", variable=self.sharpen_var, command=self.update_preview).pack(anchor="w", pady=4)
-        ttk.Checkbutton(left, text="Automatycznie przycinaj do obiektu", variable=self.auto_crop_var, command=self.update_preview).pack(anchor="w", pady=4)
-        ttk.Checkbutton(left, text="Miękkie krawędzie alpha", variable=self.feather_var, command=self.update_preview).pack(anchor="w", pady=4)
+        ttk.Checkbutton(left, text="Przytnij puste brzegi", variable=self.crop_var, command=self.rebuild_final).pack(anchor="w", pady=4)
+        ttk.Checkbutton(left, text="Wyostrz", variable=self.sharpen_var, command=self.rebuild_final).pack(anchor="w", pady=4)
 
         ttk.Separator(left).pack(fill="x", pady=10)
 
         info = (
-            "Program:\n"
-            "- wykrywa kolor tła z rogów\n"
-            "- usuwa tło\n"
-            "- przycina pustą przestrzeń\n"
-            "- centruje obiekt\n"
-            "- zapisuje PNG z przezroczystością\n\n"
-            "Najlepsze dla obrazów z jednolitym tłem."
+            "Workflow:\n"
+            "1. Wczytaj obraz\n"
+            "2. Usuń tło przez remove.bg\n"
+            "3. Program przytnie i wycentruje obiekt\n"
+            "4. Zapisz PNG pod OX Inventory"
         )
         ttk.Label(left, text=info, justify="left").pack(anchor="w", pady=4)
 
         ttk.Label(right, text="Podgląd", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 10))
         self.preview_frame = tk.Frame(right, bg="#1e1e1e", bd=1, relief="solid")
         self.preview_frame.pack(fill="both", expand=True)
-
         self.preview_label = tk.Label(self.preview_frame, bg="#1e1e1e")
         self.preview_label.pack(expand=True)
 
         self.status = ttk.Label(self.root, text="Gotowe")
         self.status.pack(fill="x", padx=12, pady=(0, 10))
 
-    def _on_padding_change(self, value):
+    def _on_padding(self, value):
         self.padding_var.set(int(float(value)))
-        self.padding_label.config(text=f"{self.padding_var.get()} px")
-        self.update_preview()
-
-    def _on_tolerance_change(self, value):
-        self.tolerance_var.set(int(float(value)))
-        self.tolerance_label.config(text=str(self.tolerance_var.get()))
-        self.update_preview()
+        self.pad_label.config(text=f"{self.padding_var.get()} px")
+        self.rebuild_final()
 
     def set_status(self, text):
         self.status.config(text=text)
         self.root.update_idletasks()
+
+    def save_api_key(self):
+        self.config["api_key"] = self.api_key_var.get().strip()
+        save_config(self.config)
+        messagebox.showinfo("OK", "Klucz API zapisany do config.json")
 
     def load_image(self):
         path = filedialog.askopenfilename(
@@ -186,120 +164,150 @@ class RenderApp:
         )
         if not path:
             return
-
         try:
-            self.image = Image.open(path).convert("RGBA")
             self.current_path = path
+            self.original_image = Image.open(path).convert("RGBA")
+            self.removed_bg_image = None
+            self.final_image = None
             self.set_status(f"Wczytano: {os.path.basename(path)}")
-            self.update_preview()
+            self.show_preview(self.original_image)
         except Exception as e:
             messagebox.showerror("Błąd", f"Nie udało się wczytać obrazu.\n\n{e}")
 
-    def build_output_image(self, img):
-        tolerance = self.tolerance_var.get()
-        feather = self.feather_var.get()
-        final_size = self.size_var.get()
-        padding = self.padding_var.get()
-        usable = max(1, final_size - padding * 2)
+    def call_removebg(self, path):
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            raise RuntimeError("Brak API key remove.bg")
 
-        processed = img.copy()
-        if self.auto_crop_var.get():
-            processed, _bg = remove_background_and_crop(processed, tolerance=tolerance, feather_alpha=feather)
-        else:
-            processed, _bg = remove_background_and_crop(processed, tolerance=tolerance, feather_alpha=feather)
+        with open(path, "rb") as f:
+            response = requests.post(
+                "https://api.remove.bg/v1.0/removebg",
+                files={"image_file": f},
+                data={
+                    "size": "auto",
+                    "format": "png",
+                    "crop": "false"
+                },
+                headers={"X-Api-Key": api_key},
+                timeout=120
+            )
 
-        rendered = ImageOps.contain(processed, (usable, usable), method=Image.LANCZOS)
+        if response.status_code != 200:
+            try:
+                details = response.json()
+            except Exception:
+                details = response.text
+            raise RuntimeError(f"remove.bg error {response.status_code}: {details}")
 
-        if self.sharpen_var.get():
-            rendered = rendered.filter(ImageFilter.SHARPEN)
+        return Image.open(io.BytesIO(response.content)).convert("RGBA")
 
-        canvas = Image.new("RGBA", (final_size, final_size), (0, 0, 0, 0))
-        x = (final_size - rendered.width) // 2
-        y = (final_size - rendered.height) // 2
-        canvas.alpha_composite(rendered, (x, y))
-        return canvas
-
-    def update_preview(self):
-        if self.image is None:
+    def remove_background(self):
+        if not self.current_path:
+            messagebox.showwarning("Brak obrazu", "Najpierw wczytaj obraz.")
             return
 
-        self.processed_image = self.build_output_image(self.image)
+        try:
+            self.set_status("Wysyłanie obrazu do remove.bg...")
+            self.removed_bg_image = self.call_removebg(self.current_path)
+            self.set_status("Tło usunięte. Składam finalny PNG...")
+            self.rebuild_final()
+        except Exception as e:
+            self.set_status("Błąd")
+            messagebox.showerror("Błąd API", str(e))
 
-        preview_size = 500
-        preview = self.processed_image.copy().resize((preview_size, preview_size), Image.NEAREST)
-        checker = self.make_checkerboard(preview_size, preview_size)
-        checker.alpha_composite(preview)
+    def rebuild_final(self):
+        if self.removed_bg_image is None:
+            return
 
-        self.preview_image = ImageTk.PhotoImage(checker)
-        self.preview_label.config(image=self.preview_image)
+        img = self.removed_bg_image.copy()
+        if self.crop_var.get():
+            img = crop_transparent(img)
 
-    def make_checkerboard(self, width, height, block=20):
-        img = Image.new("RGBA", (width, height), (0, 0, 0, 255))
-        px = img.load()
-        c1 = (70, 70, 70, 255)
-        c2 = (100, 100, 100, 255)
-        for y in range(height):
-            for x in range(width):
-                px[x, y] = c1 if ((x // block) + (y // block)) % 2 == 0 else c2
-        return img
+        self.final_image = fit_to_canvas(
+            img,
+            final_size=self.size_var.get(),
+            padding=self.padding_var.get(),
+            sharpen=self.sharpen_var.get()
+        )
+        self.show_preview(self.final_image)
+        self.set_status("Gotowe")
+
+    def show_preview(self, img):
+        preview_size = 520
+        base = checkerboard(preview_size, preview_size)
+        scaled = img.copy().resize((preview_size, preview_size), Image.NEAREST)
+        base.alpha_composite(scaled)
+        self.preview_image = ImageTk.PhotoImage(base)
+        self.preview_label.configure(image=self.preview_image)
 
     def save_image(self):
-        if self.processed_image is None:
-            messagebox.showwarning("Brak obrazu", "Najpierw wczytaj obraz.")
+        if self.final_image is None:
+            messagebox.showwarning("Brak renderu", "Najpierw usuń tło.")
             return
 
         original_name = "render"
         if self.current_path:
-            original_name = os.path.splitext(os.path.basename(self.current_path))[0]
+            original_name = Path(self.current_path).stem
 
         path = filedialog.asksaveasfilename(
             title="Zapisz PNG",
             defaultextension=".png",
-            initialfile=f"{original_name}_cutout_{self.size_var.get()}x{self.size_var.get()}.png",
+            initialfile=f"{original_name}_{self.size_var.get()}x{self.size_var.get()}.png",
             filetypes=[("PNG", "*.png")]
         )
         if not path:
             return
 
         try:
-            self.processed_image.save(path, "PNG")
+            self.final_image.save(path, "PNG")
             self.set_status(f"Zapisano: {path}")
             messagebox.showinfo("Sukces", "PNG zapisany poprawnie.")
         except Exception as e:
-            messagebox.showerror("Błąd", f"Nie udało się zapisać pliku.\n\n{e}")
+            messagebox.showerror("Błąd", str(e))
 
     def batch_render(self):
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            messagebox.showwarning("Brak klucza", "Najpierw wpisz API key.")
+            return
+
         input_dir = filedialog.askdirectory(title="Wybierz folder z obrazami")
         if not input_dir:
             return
-
         output_dir = filedialog.askdirectory(title="Wybierz folder zapisu")
         if not output_dir:
             return
 
         supported = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-        files = [f for f in os.listdir(input_dir) if os.path.splitext(f)[1].lower() in supported]
-
+        files = [f for f in os.listdir(input_dir) if Path(f).suffix.lower() in supported]
         if not files:
-            messagebox.showwarning("Brak plików", "W wybranym folderze nie ma obsługiwanych obrazów.")
+            messagebox.showwarning("Brak plików", "W folderze nie ma obsługiwanych obrazów.")
             return
 
         done = 0
-        for name in files:
-            try:
-                src = os.path.join(input_dir, name)
-                img = Image.open(src).convert("RGBA")
-                out = self.build_output_image(img)
-                stem = os.path.splitext(name)[0]
-                dst = os.path.join(output_dir, f"{stem}_cutout_{self.size_var.get()}x{self.size_var.get()}.png")
-                out.save(dst, "PNG")
-                done += 1
-                self.set_status(f"Przetworzono {done}/{len(files)}")
-            except Exception:
-                pass
+        failed = 0
 
-        self.set_status(f"Gotowe: {done}/{len(files)}")
-        messagebox.showinfo("Gotowe", f"Zrobiono {done} renderów.")
+        for name in files:
+            src = os.path.join(input_dir, name)
+            try:
+                removed = self.call_removebg(src)
+                if self.crop_var.get():
+                    removed = crop_transparent(removed)
+                final = fit_to_canvas(
+                    removed,
+                    final_size=self.size_var.get(),
+                    padding=self.padding_var.get(),
+                    sharpen=self.sharpen_var.get()
+                )
+                dst = os.path.join(output_dir, f"{Path(name).stem}_{self.size_var.get()}x{self.size_var.get()}.png")
+                final.save(dst, "PNG")
+                done += 1
+            except Exception:
+                failed += 1
+            self.set_status(f"Przetworzono {done + failed}/{len(files)}")
+
+        self.set_status(f"Gotowe. OK: {done}, błędy: {failed}")
+        messagebox.showinfo("Batch zakończony", f"OK: {done}\nBłędy: {failed}")
 
 
 if __name__ == "__main__":
@@ -309,5 +317,5 @@ if __name__ == "__main__":
         style.theme_use("clam")
     except tk.TclError:
         pass
-    RenderApp(root)
+    App(root)
     root.mainloop()
