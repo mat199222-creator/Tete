@@ -9,7 +9,7 @@ import requests
 from PIL import Image, ImageTk, ImageFilter, ImageOps
 
 APP_TITLE = "OX RemoveBG Tool"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 CONFIG_PATH = Path("config.json")
 
 
@@ -97,7 +97,7 @@ class App:
 
         ttk.Label(left, text="API key remove.bg").pack(anchor="w")
         ttk.Entry(left, textvariable=self.api_key_var, show="*", width=38).pack(fill="x", pady=(4, 8))
-        ttk.Button(left, text="Zapisz klucz", command=self.save_api_key).pack(fill="x", pady=4)
+        ttk.Button(left, text="Zapisz klucz do config.json", command=self.save_api_key).pack(fill="x", pady=4)
 
         ttk.Separator(left).pack(fill="x", pady=10)
 
@@ -126,11 +126,13 @@ class App:
         ttk.Separator(left).pack(fill="x", pady=10)
 
         info = (
+            "Program zapisuje klucz API lokalnie w config.json.\n\n"
             "Workflow:\n"
-            "1. Wczytaj obraz\n"
-            "2. Usuń tło przez remove.bg\n"
-            "3. Program przytnie i wycentruje obiekt\n"
-            "4. Zapisz PNG pod OX Inventory"
+            "1. Wpisz klucz API\n"
+            "2. Zapisz go do config.json\n"
+            "3. Wczytaj obraz\n"
+            "4. Usuń tło przez remove.bg\n"
+            "5. Zapisz PNG pod OX Inventory"
         )
         ttk.Label(left, text=info, justify="left").pack(anchor="w", pady=4)
 
@@ -153,9 +155,10 @@ class App:
         self.root.update_idletasks()
 
     def save_api_key(self):
-        self.config["api_key"] = self.api_key_var.get().strip()
+        api_key = self.api_key_var.get().strip()
+        self.config["api_key"] = api_key
         save_config(self.config)
-        messagebox.showinfo("OK", "Klucz API zapisany do config.json")
+        messagebox.showinfo("OK", "Klucz zapisany do config.json")
 
     def load_image(self):
         path = filedialog.askopenfilename(
@@ -175,7 +178,7 @@ class App:
             messagebox.showerror("Błąd", f"Nie udało się wczytać obrazu.\n\n{e}")
 
     def call_removebg(self, path):
-        api_key = self.api_key_var.get().strip()
+        api_key = self.api_key_var.get().strip() or self.config.get("api_key", "").strip()
         if not api_key:
             raise RuntimeError("Brak API key remove.bg")
 
@@ -183,11 +186,7 @@ class App:
             response = requests.post(
                 "https://api.remove.bg/v1.0/removebg",
                 files={"image_file": f},
-                data={
-                    "size": "auto",
-                    "format": "png",
-                    "crop": "false"
-                },
+                data={"size": "auto", "format": "png", "crop": "false"},
                 headers={"X-Api-Key": api_key},
                 timeout=120
             )
@@ -266,11 +265,6 @@ class App:
             messagebox.showerror("Błąd", str(e))
 
     def batch_render(self):
-        api_key = self.api_key_var.get().strip()
-        if not api_key:
-            messagebox.showwarning("Brak klucza", "Najpierw wpisz API key.")
-            return
-
         input_dir = filedialog.askdirectory(title="Wybierz folder z obrazami")
         if not input_dir:
             return
